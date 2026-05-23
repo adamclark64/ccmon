@@ -1,0 +1,52 @@
+[workspace]
+# Update CHANGELOG.md from conventional commits.
+changelog_update = true
+# Open a single Release PR that bumps Cargo.toml + CHANGELOG.md.
+pr_branch_prefix = "release-plz/"
+# Publish to crates.io when the Release PR merges.
+publish = true
+# Push a git tag (vX.Y.Z) on publish.
+git_tag_enable = true
+git_tag_name = "v{{ version }}"
+# Create a GitHub Release for the new tag — release.yml hooks off this.
+git_release_enable = true
+git_release_name = "v{{ version }}"
+# Use the CHANGELOG entry as the release body.
+git_release_body = """
+{{ changelog }}
+
+---
+See [CHANGELOG.md](https://github.com/adamclark64/ccmon/blob/main/CHANGELOG.md) for the full history.
+"""
+semver_check = false
+
+[changelog]
+header = """
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+"""
+body = """
+## [{{ version }}] - {{ timestamp | date(format="%Y-%m-%d") }}
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | upper_first }}
+{% for commit in commits %}\
+- {{ commit.message | upper_first }}{% if commit.breaking %} [**breaking**]{% endif %}\
+{% endfor %}
+{% endfor %}
+"""
+commit_parsers = [
+    { message = "^feat", group = "added" },
+    { message = "^fix", group = "fixed" },
+    { message = "^perf", group = "changed" },
+    { message = "^refactor", group = "changed" },
+    { message = "^docs", group = "documentation" },
+    { message = "^test", skip = true },
+    { message = "^chore", skip = true },
+    { message = "^ci", skip = true },
+    { message = "^build", skip = true },
+    { message = "^style", skip = true },
+]

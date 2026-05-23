@@ -1,0 +1,162 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+            archive: tar.gz
+          - target: x86_64-apple-darwin
+            os: macos-13
+            archive: tar.gz
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+            cross: true
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross (linux arm64)
+        if: matrix.cross
+        run: cargo install cross --locked
+
+      - name: Build
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --locked --target ${{ matrix.target }}
+          else
+            cargo build --release --locked --target ${{ matrix.target }}
+          fi
+
+      - name: Package
+        id: pkg
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          name="ccmon-${version}-${{ matrix.target }}"
+          mkdir -p "dist/${name}"
+          cp "target/${{ matrix.target }}/release/ccmon" "dist/${name}/ccmon"
+          cp README.md LICENSE "dist/${name}/"
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          (cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256")
+          echo "archive=dist/${name}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "checksum=dist/${name}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ steps.pkg.outputs.archive }}
+            ${{ steps.pkg.outputs.checksum }}
+          fail_on_unmatched_files: true
+
+  homebrew:
+    name: update homebrew formula
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute checksums + rewrite formula
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}"
+
+          fetch_sha() {
+            local target="$1"
+            local url="${base}/ccmon-${version}-${target}.tar.gz"
+            curl -sSL "$url" | shasum -a 256 | awk '{print $1}'
+          }
+
+          arm_mac=$(fetch_sha aarch64-apple-darwin)
+          intel_mac=$(fetch_sha x86_64-apple-darwin)
+          intel_linux=$(fetch_sha x86_64-unknown-linux-gnu)
+          arm_linux=$(fetch_sha aarch64-unknown-linux-gnu)
+
+          cat > homebrew/ccmon.rb <<EOF
+          class Ccmon < Formula
+            desc "List running Claude Code agents & subagents, open a viewer in a new terminal tab"
+            homepage "https://github.com/adamclark64/ccmon"
+            version "${version}"
+            license "MIT"
+
+            depends_on "jq"
+            depends_on "tmux"
+
+            on_macos do
+              on_arm do
+                url "${base}/ccmon-${version}-aarch64-apple-darwin.tar.gz"
+                sha256 "${arm_mac}"
+              end
+              on_intel do
+                url "${base}/ccmon-${version}-x86_64-apple-darwin.tar.gz"
+                sha256 "${intel_mac}"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "${base}/ccmon-${version}-aarch64-unknown-linux-gnu.tar.gz"
+                sha256 "${arm_linux}"
+              end
+              on_intel do
+                url "${base}/ccmon-${version}-x86_64-unknown-linux-gnu.tar.gz"
+                sha256 "${intel_linux}"
+              end
+            end
+
+            def install
+              bin.install "ccmon"
+            end
+
+            test do
+              system bin/"ccmon", "--list"
+            end
+          end
+          EOF
+
+      - name: Commit + push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet homebrew/ccmon.rb; then
+            echo "no formula changes"
+            exit 0
+          fi
+          git add homebrew/ccmon.rb
+          git commit -m "chore(release): update homebrew formula for ${GITHUB_REF_NAME}"
+          git push origin main
