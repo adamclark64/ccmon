@@ -1,7 +1,10 @@
 use crate::{decode_project, format_age, Entry, Kind};
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        MouseButton, MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -24,7 +27,7 @@ pub fn run(entries: Vec<Entry>, max_age_hours: u64) -> Result<Option<Entry>> {
     }
     enable_raw_mode()?;
     let mut out = stdout();
-    execute!(out, EnterAlternateScreen)?;
+    execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(out);
     let mut terminal = Terminal::new(backend)?;
 
@@ -32,7 +35,12 @@ pub fn run(entries: Vec<Entry>, max_age_hours: u64) -> Result<Option<Entry>> {
     let result = event_loop(&mut terminal, &mut app);
 
     disable_raw_mode().ok();
-    execute!(terminal.backend_mut(), LeaveAlternateScreen).ok();
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )
+    .ok();
     terminal.show_cursor().ok();
 
     result.map(|picked| {
@@ -52,6 +60,11 @@ struct App {
     max_age_hours: u64,
     preview: Vec<Line<'static>>,
     preview_for: Option<(usize, Instant)>,
+    preview_scroll: u16,
+    preview_stuck_bottom: bool,
+    preview_viewport_h: u16,
+    list_area: Rect,
+    preview_area: Rect,
 }
 
 impl App {
@@ -69,7 +82,29 @@ impl App {
             max_age_hours,
             preview: Vec::new(),
             preview_for: None,
+            preview_scroll: 0,
+            preview_stuck_bottom: true,
+            preview_viewport_h: 0,
+            list_area: Rect::default(),
+            preview_area: Rect::default(),
         }
+    }
+
+    fn scroll_preview(&mut self, delta: i32) {
+        let viewport = self.preview_viewport_h.max(1) as i32;
+        let total = self.preview.len() as i32;
+        let max_offset = (total - viewport).max(0);
+        let next = (self.preview_scroll as i32 + delta).clamp(0, max_offset);
+        self.preview_scroll = next as u16;
+        self.preview_stuck_bottom = next >= max_offset;
+    }
+
+    fn stick_preview_to_bottom(&mut self) {
+        let viewport = self.preview_viewport_h.max(1) as i32;
+        let total = self.preview.len() as i32;
+        let max_offset = (total - viewport).max(0);
+        self.preview_scroll = max_offset as u16;
+        self.preview_stuck_bottom = true;
     }
 
     fn selected_entry(&self) -> Option<&Entry> {
@@ -113,6 +148,8 @@ impl App {
         }
         self.preview.clear();
         self.preview_for = None;
+        self.preview_scroll = 0;
+        self.preview_stuck_bottom = true;
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -126,7 +163,7 @@ impl App {
     }
 }
 
-fn draw(f: &mut Frame, app: &App) {
+fn draw(f: &mut Frame, app: &mut App) {
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -140,6 +177,8 @@ fn draw(f: &mut Frame, app: &App) {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
         .split(root[1]);
+    app.list_area = cols[0];
+    app.preview_area = cols[1];
     draw_list(f, cols[0], app);
     draw_preview(f, cols[1], app);
     draw_footer(f, root[2], app);
@@ -185,10 +224,12 @@ fn draw_footer(f: &mut Frame, area: Rect, _app: &App) {
         Span::raw(" move  "),
         dim("enter"),
         Span::raw(" attach  "),
+        dim("PgUp/Dn"),
+        Span::raw(" scroll  "),
+        dim("End"),
+        Span::raw(" follow  "),
         dim("type"),
         Span::raw(" filter  "),
-        dim("⌫"),
-        Span::raw(" del  "),
         dim("esc/q"),
         Span::raw(" quit"),
     ]);
@@ -286,8 +327,15 @@ fn trunc(s: &str, n: usize) -> String {
     }
 }
 
-fn draw_preview(f: &mut Frame, area: Rect, app: &App) {
-    let title = match app.selected_entry() {
+fn draw_preview(f: &mut Frame, area: Rect, app: &mut App) {
+    // Record inner viewport height (area minus the 2 border lines) so
+    // scroll handlers can clamp + auto-stick correctly.
+    app.preview_viewport_h = area.height.saturating_sub(2);
+    if app.preview_stuck_bottom {
+        app.stick_preview_to_bottom();
+    }
+
+    let base_title = match app.selected_entry() {
         Some(e) => {
             let proj = e
                 .cwd
@@ -302,10 +350,18 @@ fn draw_preview(f: &mut Frame, area: Rect, app: &App) {
         }
         None => " preview ".to_string(),
     };
+    let indicator = if app.preview_stuck_bottom {
+        Span::styled(" ▾ live ", Style::default().fg(Color::Green))
+    } else {
+        Span::styled(" ▴ scrolled ", Style::default().fg(Color::Yellow))
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
-        .title(Span::styled(title, Style::default().fg(Color::Cyan)));
+        .title(Line::from(vec![
+            Span::styled(base_title, Style::default().fg(Color::Cyan)),
+            indicator,
+        ]));
     let body = if app.preview.is_empty() {
         vec![Line::from(Span::styled(
             "(no transcript yet)",
@@ -314,7 +370,10 @@ fn draw_preview(f: &mut Frame, area: Rect, app: &App) {
     } else {
         app.preview.clone()
     };
-    let para = Paragraph::new(body).block(block).wrap(Wrap { trim: false });
+    let para = Paragraph::new(body)
+        .block(block)
+        .wrap(Wrap { trim: false })
+        .scroll((app.preview_scroll, 0));
     f.render_widget(para, area);
 }
 
@@ -331,16 +390,24 @@ fn ensure_preview(app: &mut App) {
         Some(i) => *i,
         None => return,
     };
+    let selection_changed = app.preview_for.map(|(i, _)| i != idx).unwrap_or(true);
     let stale = app
         .preview_for
-        .map(|(i, t)| i != idx || t.elapsed() > Duration::from_millis(750))
+        .map(|(_, t)| t.elapsed() > Duration::from_millis(750))
         .unwrap_or(true);
-    if !stale {
+    if !selection_changed && !stale {
         return;
     }
+    if selection_changed {
+        app.preview_scroll = 0;
+        app.preview_stuck_bottom = true;
+    }
     let path = app.entries[idx].path.clone();
-    app.preview = load_preview(&path, 120);
+    app.preview = load_preview(&path, 2000);
     app.preview_for = Some((idx, Instant::now()));
+    if app.preview_stuck_bottom {
+        app.stick_preview_to_bottom();
+    }
 }
 
 fn load_preview(path: &Path, tail: usize) -> Vec<Line<'static>> {
@@ -430,10 +497,6 @@ fn load_preview(path: &Path, tail: usize) -> Vec<Line<'static>> {
             _ => {}
         }
     }
-    let max = 200;
-    if out.len() > max {
-        out.drain(0..out.len() - max);
-    }
     out
 }
 
@@ -444,8 +507,40 @@ fn event_loop(
     loop {
         ensure_preview(app);
         terminal.draw(|f| draw(f, app))?;
+        let preview_step = (app.preview_viewport_h / 2).max(1) as i32;
         if event::poll(Duration::from_millis(500))? {
-            if let Event::Key(k) = event::read()? {
+            let evt = event::read()?;
+            if let Event::Mouse(me) = evt {
+                let col = me.column;
+                let row = me.row;
+                let in_preview = app.preview_area.width > 0
+                    && col >= app.preview_area.x
+                    && col < app.preview_area.x + app.preview_area.width;
+                let in_list = app.list_area.width > 0
+                    && col >= app.list_area.x
+                    && col < app.list_area.x + app.list_area.width;
+                match me.kind {
+                    MouseEventKind::ScrollDown if in_preview => app.scroll_preview(3),
+                    MouseEventKind::ScrollUp if in_preview => app.scroll_preview(-3),
+                    MouseEventKind::ScrollDown if in_list => app.move_selection(1),
+                    MouseEventKind::ScrollUp if in_list => app.move_selection(-1),
+                    MouseEventKind::Down(MouseButton::Left)
+                        if in_list
+                            && row > app.list_area.y
+                            && row < app.list_area.y + app.list_area.height - 1 =>
+                    {
+                        let target = (row - app.list_area.y - 1) as usize;
+                        if target < app.visible.len() {
+                            app.state.select(Some(target));
+                            app.preview_scroll = 0;
+                            app.preview_stuck_bottom = true;
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            if let Event::Key(k) = evt {
                 if k.kind != KeyEventKind::Press {
                     continue;
                 }
@@ -464,8 +559,10 @@ fn event_loop(
                     (KeyCode::Up, _) | (KeyCode::Char('k'), KeyModifiers::CONTROL) => {
                         app.move_selection(-1)
                     }
-                    (KeyCode::PageDown, _) => app.move_selection(10),
-                    (KeyCode::PageUp, _) => app.move_selection(-10),
+                    (KeyCode::PageDown, _) => app.scroll_preview(preview_step),
+                    (KeyCode::PageUp, _) => app.scroll_preview(-preview_step),
+                    (KeyCode::End, _) => app.stick_preview_to_bottom(),
+                    (KeyCode::Home, _) => app.scroll_preview(i32::MIN / 2),
                     (KeyCode::Backspace, _) => {
                         app.filter.pop();
                         app.refilter();
