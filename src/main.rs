@@ -352,9 +352,7 @@ fn running_claudes() -> Vec<(String, Option<String>)> {
         } else {
             Some(format!("/dev/{tty}"))
         };
-        running.push((sid, tty_dev.map(|s| s)));
-        // We carry the tty in the Option slot for now; we'll convert to tmux session name below.
-        let _ = &mut running;
+        running.push((sid, tty_dev));
     }
     if running.is_empty() {
         return Vec::new();

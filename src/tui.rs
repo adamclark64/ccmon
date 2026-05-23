@@ -411,11 +411,7 @@ fn event_loop(
                     (KeyCode::Char('q'), m) if !m.contains(KeyModifiers::CONTROL) && app.filter.is_empty() => {
                         return Ok(false)
                     }
-                    (KeyCode::Enter, _) => {
-                        if app.selected_entry().is_some() {
-                            return Ok(true);
-                        }
-                    }
+                    (KeyCode::Enter, _) if app.selected_entry().is_some() => return Ok(true),
                     (KeyCode::Down, _) | (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
                         app.move_selection(1)
                     }
