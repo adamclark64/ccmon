@@ -57,13 +57,14 @@ impl std::fmt::Display for Entry {
         let proj = self
             .cwd
             .as_deref()
-            .and_then(|c| Path::new(c).file_name().map(|n| n.to_string_lossy().to_string()))
+            .and_then(|c| {
+                Path::new(c)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+            })
             .unwrap_or_else(|| decode_project(&self.project));
         let title = truncate(&self.summary, 60);
-        write!(
-            f,
-            "{state:<10}  {age:>4}  {kind:<10}  {proj:<32}  {title}"
-        )
+        write!(f, "{state:<10}  {age:>4}  {kind:<10}  {proj:<32}  {title}")
     }
 }
 
@@ -200,8 +201,8 @@ fn extract_text(v: &serde_json::Value) -> String {
 
 fn discover(root: &Path, max_age_hours: u64) -> Result<Vec<Entry>> {
     let mut out = Vec::new();
-    let cutoff = SystemTime::now()
-        .checked_sub(std::time::Duration::from_secs(max_age_hours * 3600));
+    let cutoff =
+        SystemTime::now().checked_sub(std::time::Duration::from_secs(max_age_hours * 3600));
     for entry in WalkDir::new(root).max_depth(5).into_iter().flatten() {
         let p = entry.path();
         if !p.is_file() || p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
@@ -225,7 +226,11 @@ fn discover(root: &Path, max_age_hours: u64) -> Result<Vec<Entry>> {
         let (kind, project, id) = match parts.len() {
             2 => {
                 let project = parts[0].as_os_str().to_string_lossy().to_string();
-                let id = p.file_stem().unwrap_or_default().to_string_lossy().to_string();
+                let id = p
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
                 (Kind::Agent, project, id)
             }
             4 => {
@@ -234,7 +239,11 @@ fn discover(root: &Path, max_age_hours: u64) -> Result<Vec<Entry>> {
                 if sub_dir != "subagents" {
                     continue;
                 }
-                let id = p.file_stem().unwrap_or_default().to_string_lossy().to_string();
+                let id = p
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
                 (Kind::Subagent, project, id)
             }
             _ => continue,
@@ -253,11 +262,25 @@ fn discover(root: &Path, max_age_hours: u64) -> Result<Vec<Entry>> {
             (cwd, summary, None)
         };
         let summary = summary.unwrap_or_else(|| id.clone());
-        out.push(Entry { kind, project, id, path: p.to_path_buf(), mtime, summary, cwd, tmux_session: None, running: false, agent_type });
+        out.push(Entry {
+            kind,
+            project,
+            id,
+            path: p.to_path_buf(),
+            mtime,
+            summary,
+            cwd,
+            tmux_session: None,
+            running: false,
+            agent_type,
+        });
     }
     // Match running claude processes to JSONL entries by session-id (UUID == file stem).
     for (sid, tmux) in running_claudes() {
-        if let Some(e) = out.iter_mut().find(|e| e.id == sid && e.kind == Kind::Agent) {
+        if let Some(e) = out
+            .iter_mut()
+            .find(|e| e.id == sid && e.kind == Kind::Agent)
+        {
             e.running = true;
             e.tmux_session = tmux;
         }
@@ -282,9 +305,16 @@ fn discover(root: &Path, max_age_hours: u64) -> Result<Vec<Entry>> {
             .and_then(|p| p.parent())
             .and_then(|p| p.file_name())
             .map(|s| s.to_string_lossy().to_string());
-        let Some(parent_sid) = parent_sid else { continue };
-        let Some(parent_tmux) = running_agents.get(&parent_sid) else { continue };
-        let is_fresh = now.duration_since(e.mtime).map(|d| d < fresh).unwrap_or(false);
+        let Some(parent_sid) = parent_sid else {
+            continue;
+        };
+        let Some(parent_tmux) = running_agents.get(&parent_sid) else {
+            continue;
+        };
+        let is_fresh = now
+            .duration_since(e.mtime)
+            .map(|d| d < fresh)
+            .unwrap_or(false);
         if is_fresh {
             e.running = true;
             e.tmux_session = parent_tmux.clone();
@@ -293,9 +323,13 @@ fn discover(root: &Path, max_age_hours: u64) -> Result<Vec<Entry>> {
     out.sort_by(|a, b| {
         // Order: live (in tmux) > running > others, then by mtime desc.
         let rank = |e: &Entry| {
-            if e.tmux_session.is_some() { 2 }
-            else if e.running { 1 }
-            else { 0 }
+            if e.tmux_session.is_some() {
+                2
+            } else if e.running {
+                1
+            } else {
+                0
+            }
         };
         rank(b).cmp(&rank(a)).then(b.mtime.cmp(&a.mtime))
     });
@@ -318,10 +352,7 @@ fn tmux_sessions() -> Vec<String> {
 /// For each running `claude` CLI process, returns (session_id, tmux_session_name_if_in_tmux).
 /// Session ID comes from the process's `--session-id <UUID>` arg, which matches the JSONL filename.
 fn running_claudes() -> Vec<(String, Option<String>)> {
-    let ps_out = match Command::new("ps")
-        .args(["-axo", "tty=,command="])
-        .output()
-    {
+    let ps_out = match Command::new("ps").args(["-axo", "tty=,command="]).output() {
         Ok(o) if o.status.success() => o.stdout,
         _ => return Vec::new(),
     };
@@ -336,7 +367,10 @@ fn running_claudes() -> Vec<(String, Option<String>)> {
         };
         let rest = rest.trim_start();
         let bin = rest.split_whitespace().next().unwrap_or("");
-        let base = Path::new(bin).file_name().and_then(|s| s.to_str()).unwrap_or("");
+        let base = Path::new(bin)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
         if base != "claude" && base != "claude-code" {
             continue;
         }
@@ -361,7 +395,8 @@ fn running_claudes() -> Vec<(String, Option<String>)> {
     let tmux_out = Command::new("tmux")
         .args(["list-panes", "-aF", "#{pane_tty}\t#{session_name}"])
         .output();
-    let mut tty_to_session: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut tty_to_session: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     if let Ok(o) = tmux_out {
         if o.status.success() {
             for line in String::from_utf8_lossy(&o.stdout).lines() {
@@ -460,7 +495,10 @@ fn open_viewer(entry: &Entry) -> Result<()> {
     let path = entry.path.to_string_lossy().to_string();
     let label = format!(
         "{} {} ({})",
-        match entry.kind { Kind::Agent => "agent", Kind::Subagent => "subagent" },
+        match entry.kind {
+            Kind::Agent => "agent",
+            Kind::Subagent => "subagent",
+        },
         decode_project(&entry.project),
         DateTime::<Local>::from(entry.mtime).format("%H:%M"),
     );

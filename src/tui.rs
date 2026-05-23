@@ -35,7 +35,13 @@ pub fn run(entries: Vec<Entry>, max_age_hours: u64) -> Result<Option<Entry>> {
     execute!(terminal.backend_mut(), LeaveAlternateScreen).ok();
     terminal.show_cursor().ok();
 
-    result.map(|picked| if picked { app.selected_entry().cloned() } else { None })
+    result.map(|picked| {
+        if picked {
+            app.selected_entry().cloned()
+        } else {
+            None
+        }
+    })
 }
 
 struct App {
@@ -85,7 +91,11 @@ impl App {
                 let proj = e
                     .cwd
                     .as_deref()
-                    .and_then(|c| Path::new(c).file_name().map(|n| n.to_string_lossy().to_string()))
+                    .and_then(|c| {
+                        Path::new(c)
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                    })
                     .unwrap_or_else(|| decode_project(&e.project));
                 e.summary.to_lowercase().contains(&needle)
                     || proj.to_lowercase().contains(&needle)
@@ -119,7 +129,11 @@ impl App {
 fn draw(f: &mut Frame, app: &App) {
     let root = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
         .split(f.area());
     draw_title(f, root[0], app);
     let cols = Layout::default()
@@ -135,7 +149,12 @@ fn draw_title(f: &mut Frame, area: Rect, app: &App) {
     let total = app.entries.len();
     let shown = app.visible.len();
     let mut spans = vec![
-        Span::styled("ccmon", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "ccmon",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw("  "),
         Span::styled(
             format!("{shown}/{total} agents"),
@@ -152,7 +171,9 @@ fn draw_title(f: &mut Frame, area: Rect, app: &App) {
         spans.push(Span::styled("/", Style::default().fg(Color::Yellow)));
         spans.push(Span::styled(
             app.filter.clone(),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         ));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -160,11 +181,16 @@ fn draw_title(f: &mut Frame, area: Rect, app: &App) {
 
 fn draw_footer(f: &mut Frame, area: Rect, _app: &App) {
     let hint = Line::from(vec![
-        dim("↑↓"), Span::raw(" move  "),
-        dim("enter"), Span::raw(" attach  "),
-        dim("type"), Span::raw(" filter  "),
-        dim("⌫"), Span::raw(" del  "),
-        dim("esc/q"), Span::raw(" quit"),
+        dim("↑↓"),
+        Span::raw(" move  "),
+        dim("enter"),
+        Span::raw(" attach  "),
+        dim("type"),
+        Span::raw(" filter  "),
+        dim("⌫"),
+        Span::raw(" del  "),
+        dim("esc/q"),
+        Span::raw(" quit"),
     ]);
     f.render_widget(Paragraph::new(hint), area);
 }
@@ -198,7 +224,12 @@ fn draw_list(f: &mut Frame, area: Rect, app: &App) {
 
 fn render_row(e: &Entry) -> Line<'static> {
     let (state_glyph, state_style) = if e.tmux_session.is_some() {
-        ("●", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+        (
+            "●",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )
     } else if e.running {
         ("○", Style::default().fg(Color::Yellow))
     } else {
@@ -223,7 +254,11 @@ fn render_row(e: &Entry) -> Line<'static> {
     let proj = e
         .cwd
         .as_deref()
-        .and_then(|c| Path::new(c).file_name().map(|n| n.to_string_lossy().to_string()))
+        .and_then(|c| {
+            Path::new(c)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+        })
         .unwrap_or_else(|| decode_project(&e.project));
     let title = trunc(&e.summary, 80);
     Line::from(vec![
@@ -232,7 +267,9 @@ fn render_row(e: &Entry) -> Line<'static> {
         Span::styled(format!("{kind_label:<12} "), kind_style),
         Span::styled(
             format!("{proj:<22} "),
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(title, Style::default().fg(Color::Gray)),
     ])
@@ -255,7 +292,11 @@ fn draw_preview(f: &mut Frame, area: Rect, app: &App) {
             let proj = e
                 .cwd
                 .as_deref()
-                .and_then(|c| Path::new(c).file_name().map(|n| n.to_string_lossy().to_string()))
+                .and_then(|c| {
+                    Path::new(c)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                })
                 .unwrap_or_else(|| decode_project(&e.project));
             format!(" {} · {} ", proj, format_age(e.mtime))
         }
@@ -307,10 +348,7 @@ fn load_preview(path: &Path, tail: usize) -> Vec<Line<'static>> {
         Ok(f) => f,
         Err(_) => return Vec::new(),
     };
-    let lines: Vec<String> = BufReader::new(f)
-        .lines()
-        .map_while(Result::ok)
-        .collect();
+    let lines: Vec<String> = BufReader::new(f).lines().map_while(Result::ok).collect();
     let start = lines.len().saturating_sub(tail);
     let mut out: Vec<Line<'static>> = Vec::new();
     for raw in &lines[start..] {
@@ -324,9 +362,13 @@ fn load_preview(path: &Path, tail: usize) -> Vec<Line<'static>> {
         }
         let tag = if typ == "user" { "u" } else { "a" };
         let tag_style = if typ == "user" {
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD)
         };
         let content = v.get("message").and_then(|m| m.get("content"));
         match content {
@@ -360,7 +402,9 @@ fn load_preview(path: &Path, tail: usize) -> Vec<Line<'static>> {
                                 Span::styled("→ ", Style::default().fg(Color::Green)),
                                 Span::styled(
                                     name.to_string(),
-                                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                                    Style::default()
+                                        .fg(Color::Green)
+                                        .add_modifier(Modifier::BOLD),
                                 ),
                                 Span::styled(
                                     format!("({input})"),
@@ -408,7 +452,9 @@ fn event_loop(
                 match (k.code, k.modifiers) {
                     (KeyCode::Esc, _) => return Ok(false),
                     (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(false),
-                    (KeyCode::Char('q'), m) if !m.contains(KeyModifiers::CONTROL) && app.filter.is_empty() => {
+                    (KeyCode::Char('q'), m)
+                        if !m.contains(KeyModifiers::CONTROL) && app.filter.is_empty() =>
+                    {
                         return Ok(false)
                     }
                     (KeyCode::Enter, _) if app.selected_entry().is_some() => return Ok(true),
