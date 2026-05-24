@@ -1,5 +1,7 @@
 # ccmon — claude code monitor
 
+![ccmon screenshot](assets/ccmon.png)
+
 Interactive TUI for active Claude Code agents and subagents. Two-pane picker: list on the left, live-tailing transcript preview on the right. Select one and a new terminal tab opens with a live viewer of that session — for tmux-backed sessions you actually attach and can drive it.
 
 ## What it shows
