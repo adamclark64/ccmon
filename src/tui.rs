@@ -1,4 +1,4 @@
-use crate::{decode_project, format_age, Entry, Kind};
+use crate::{decode_project, discover, format_age, Entry, Kind};
 use anyhow::Result;
 use crossterm::{
     event::{
@@ -18,10 +18,14 @@ use ratatui::{
 };
 use std::fs::File;
 use std::io::{stdout, BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-pub fn run(entries: Vec<Entry>, max_age_hours: u64) -> Result<Option<Entry>> {
+/// How often the agent list is re-scanned from disk while the TUI is open, so
+/// newly-started agents appear without restarting ccmon.
+const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+
+pub fn run(entries: Vec<Entry>, root: PathBuf, max_age_hours: u64) -> Result<Option<Entry>> {
     if entries.is_empty() {
         return Ok(None);
     }
@@ -31,7 +35,7 @@ pub fn run(entries: Vec<Entry>, max_age_hours: u64) -> Result<Option<Entry>> {
     let backend = CrosstermBackend::new(out);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(entries, max_age_hours);
+    let mut app = App::new(entries, root, max_age_hours);
     let result = event_loop(&mut terminal, &mut app);
 
     disable_raw_mode().ok();
@@ -57,6 +61,8 @@ struct App {
     visible: Vec<usize>,
     state: ListState,
     filter: String,
+    root: PathBuf,
+    last_refresh: Instant,
     max_age_hours: u64,
     preview: Vec<Line<'static>>,
     preview_for: Option<(usize, Instant)>,
@@ -68,7 +74,7 @@ struct App {
 }
 
 impl App {
-    fn new(entries: Vec<Entry>, max_age_hours: u64) -> Self {
+    fn new(entries: Vec<Entry>, root: PathBuf, max_age_hours: u64) -> Self {
         let visible: Vec<usize> = (0..entries.len()).collect();
         let mut state = ListState::default();
         if !visible.is_empty() {
@@ -79,6 +85,8 @@ impl App {
             visible,
             state,
             filter: String::new(),
+            root,
+            last_refresh: Instant::now(),
             max_age_hours,
             preview: Vec::new(),
             preview_for: None,
@@ -113,10 +121,10 @@ impl App {
         self.entries.get(idx)
     }
 
-    fn refilter(&mut self) {
+    /// Indices into `entries` that match the current filter, preserving order.
+    fn compute_visible(&self) -> Vec<usize> {
         let needle = self.filter.to_lowercase();
-        self.visible = self
-            .entries
+        self.entries
             .iter()
             .enumerate()
             .filter(|(_, e)| {
@@ -132,15 +140,23 @@ impl App {
                             .map(|n| n.to_string_lossy().to_string())
                     })
                     .unwrap_or_else(|| decode_project(&e.project));
-                e.summary.to_lowercase().contains(&needle)
-                    || proj.to_lowercase().contains(&needle)
-                    || e.agent_type
-                        .as_deref()
+                let matches = |s: &Option<String>| {
+                    s.as_deref()
                         .map(|t| t.to_lowercase().contains(&needle))
                         .unwrap_or(false)
+                };
+                e.summary.to_lowercase().contains(&needle)
+                    || proj.to_lowercase().contains(&needle)
+                    || matches(&e.agent_type)
+                    || matches(&e.agent_name)
+                    || matches(&e.team_name)
             })
             .map(|(i, _)| i)
-            .collect();
+            .collect()
+    }
+
+    fn refilter(&mut self) {
+        self.visible = self.compute_visible();
         if self.visible.is_empty() {
             self.state.select(None);
         } else {
@@ -150,6 +166,49 @@ impl App {
         self.preview_for = None;
         self.preview_scroll = 0;
         self.preview_stuck_bottom = true;
+    }
+
+    /// Re-scan `~/.claude/projects` and merge the result in, keeping the user's
+    /// place: the same agent stays selected, the filter is reapplied, and the
+    /// preview's scroll position is preserved. Called on an interval so agents
+    /// started after ccmon launched still show up.
+    fn refresh(&mut self) {
+        self.last_refresh = Instant::now();
+        let Ok(entries) = discover(&self.root, self.max_age_hours) else {
+            return;
+        };
+        // Remember what's selected (by stable identity) so we can re-find it
+        // after the list is rebuilt and possibly reordered.
+        let selected = self.selected_entry().map(|e| (e.kind, e.id.clone()));
+        self.entries = entries;
+        self.visible = self.compute_visible();
+        let new_row = selected.and_then(|(kind, id)| {
+            self.visible
+                .iter()
+                .position(|&i| self.entries[i].kind == kind && self.entries[i].id == id)
+        });
+        match new_row {
+            Some(row) => {
+                self.state.select(Some(row));
+                // Point preview_for at the selection's new index so ensure_preview
+                // doesn't treat the refresh as a selection change and reset scroll.
+                if let Some(&idx) = self.visible.get(row) {
+                    if let Some((_, t)) = self.preview_for {
+                        self.preview_for = Some((idx, t));
+                    }
+                }
+            }
+            None => {
+                // Previously-selected agent is gone (or filtered out): fall back
+                // to the first row and let the preview reload.
+                self.state.select(if self.visible.is_empty() {
+                    None
+                } else {
+                    Some(0)
+                });
+                self.preview_for = None;
+            }
+        }
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -302,7 +361,7 @@ fn render_row(e: &Entry) -> Line<'static> {
         })
         .unwrap_or_else(|| decode_project(&e.project));
     let title = trunc(&e.summary, 80);
-    Line::from(vec![
+    let mut spans = vec![
         Span::styled(format!("{state_glyph} "), state_style),
         Span::styled(format!("{age:>4} "), Style::default().fg(Color::DarkGray)),
         Span::styled(format!("{kind_label:<12} "), kind_style),
@@ -312,8 +371,19 @@ fn render_row(e: &Entry) -> Line<'static> {
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(title, Style::default().fg(Color::Gray)),
-    ])
+    ];
+    // Swarm teammates all share a project/transcript-summary, so lead with the
+    // teammate name to make each row identifiable (e.g. "probe-two").
+    if let Some(name) = e.agent_name.as_deref() {
+        spans.push(Span::styled(
+            format!("{name} "),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    spans.push(Span::styled(title, Style::default().fg(Color::Gray)));
+    Line::from(spans)
 }
 
 fn trunc(s: &str, n: usize) -> String {
@@ -505,6 +575,9 @@ fn event_loop(
     app: &mut App,
 ) -> Result<bool> {
     loop {
+        if app.last_refresh.elapsed() >= REFRESH_INTERVAL {
+            app.refresh();
+        }
         ensure_preview(app);
         terminal.draw(|f| draw(f, app))?;
         let preview_step = (app.preview_viewport_h / 2).max(1) as i32;

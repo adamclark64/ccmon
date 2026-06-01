@@ -11,7 +11,9 @@ Walks `~/.claude/projects/` and lists:
 - **agent** — top-level sessions (`<project>/<session>.jsonl`)
 - **subagent** — Task-tool subagent runs (`<project>/<session>/subagents/agent-*.jsonl`)
 
-Sorted live → running → others, newest first within each group. Default age cutoff is 6h (override with `CCMON_MAX_AGE_HOURS`).
+Sorted live → running → others, newest first within each group. Default age cutoff is 6h (override with `CCMON_MAX_AGE_HOURS`). The list re-scans every couple of seconds while open, so agents started after launch show up without a restart (your selection, filter, and preview scroll position are kept).
+
+Swarm teammates (from `claude-swarm` / agent teams) are detected too, and each row is labelled with its teammate name so you can tell them apart.
 
 ## Usage
 
@@ -26,16 +28,16 @@ ccmon spawn [PATH]     # launch claude in a new Ghostty window wrapped in a name
 | key | action |
 | --- | --- |
 | `↑` / `↓` / PgUp / PgDn | move selection |
-| type letters | filter list (summary + project + agent-type) |
+| type letters | filter list (summary + project + agent-type + teammate/team name) |
 | `⌫` | delete filter char |
 | `enter` | attach to selected (tmux attach for live, transcript tailer otherwise) |
 | `esc` / `q` / `ctrl-c` | quit |
 
 ### Picker behavior
 
-Each entry has one of three states, detected by scanning `ps` for `claude --session-id <UUID>` processes and cross-referencing their TTY with `tmux list-panes`:
+Each entry has one of three states, detected by scanning `ps` for running claude processes and cross-referencing their TTY with `tmux list-panes` across **every** tmux socket (the default server plus any named `-L` sockets, which is where `claude-swarm` runs each swarm). Normal sessions are matched by `--session-id <UUID>`; swarm teammates (which carry `--agent-name`/`--team-name` instead) are matched by their transcript's `agentName`/`teamName`:
 
-- **● live** — running claude process whose TTY is a tmux pane. Selecting splits the current terminal pane (sends Cmd+D) and runs `tmux attach -t <session>` (real attach: typing drives the same claude).
+- **● live** — running claude process whose TTY is a tmux pane. Selecting splits the current terminal pane (sends Cmd+D) and runs `tmux attach -t <session>` (`tmux -L <socket> attach …` for a swarm socket) — a real attach: typing drives the same claude.
 - **○ running** — running claude process not inside tmux. Selecting splits the current pane and opens the transcript tailer (read-only — you can see what it's doing live, but there's no PTY to attach to since it was spawned in a raw terminal).
 - **· stale** — historical session; transcript tailer only.
 
@@ -48,7 +50,7 @@ cd ~/repos/job-search-app
 ccmon spawn               # opens new Ghostty: `tmux new-session -s claude-job-search-app claude`
 ```
 
-You can also just use plain tmux — any naming convention works since detection is by PID+TTY, not by session name.
+You can also just use plain tmux — any naming convention works since detection is by PID+TTY, not by session name. Sessions on any tmux socket are found, so `claude-swarm` teammates are attachable the same way (via their swarm's `-L` socket).
 
 ## Install
 
