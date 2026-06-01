@@ -26,8 +26,15 @@ pub(crate) struct Entry {
     pub(crate) summary: String,
     pub(crate) cwd: Option<String>,
     pub(crate) tmux_session: Option<String>,
+    /// tmux socket name the session lives on (`-L <socket>`). `None` for the
+    /// default server. claude-swarm runs each swarm on its own socket.
+    pub(crate) tmux_socket: Option<String>,
     pub(crate) running: bool,
     pub(crate) agent_type: Option<String>,
+    /// Swarm teammate identity (from the transcript's `agentName`/`teamName`),
+    /// used to match the running teammate process which carries no session-id.
+    pub(crate) agent_name: Option<String>,
+    pub(crate) team_name: Option<String>,
 }
 
 pub const HEADER: &str = "  STATE       AGE   KIND        PROJECT                          TITLE";
@@ -63,7 +70,11 @@ impl std::fmt::Display for Entry {
                     .map(|n| n.to_string_lossy().to_string())
             })
             .unwrap_or_else(|| decode_project(&self.project));
-        let title = truncate(&self.summary, 60);
+        let summary = match self.agent_name.as_deref() {
+            Some(name) => format!("{name}  {}", self.summary),
+            None => self.summary.clone(),
+        };
+        let title = truncate(&summary, 60);
         write!(f, "{state:<10}  {age:>4}  {kind:<10}  {proj:<32}  {title}")
     }
 }
@@ -112,6 +123,20 @@ struct AnyRecord {
     summary: Option<String>,
     #[serde(default)]
     cwd: Option<String>,
+    #[serde(default, rename = "agentName")]
+    agent_name: Option<String>,
+    #[serde(default, rename = "teamName")]
+    team_name: Option<String>,
+}
+
+/// What a transcript scan extracts about a session.
+#[derive(Default)]
+struct Scan {
+    summary: Option<String>,
+    cwd: Option<String>,
+    /// Swarm teammate identity, present only for swarm-spawned sessions.
+    agent_name: Option<String>,
+    team_name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -143,20 +168,35 @@ fn read_agent_meta(jsonl: &Path) -> (Option<String>, Option<String>) {
     }
 }
 
-fn scan_jsonl(path: &Path) -> (Option<String>, Option<String>) {
-    // returns (summary, cwd)
+fn scan_jsonl(path: &Path) -> Scan {
     let f = match File::open(path) {
         Ok(f) => f,
-        Err(_) => return (None, None),
+        Err(_) => return Scan::default(),
     };
     let reader = BufReader::new(f);
     let mut summary: Option<String> = None;
     let mut cwd: Option<String> = None;
+    let mut agent_name: Option<String> = None;
+    let mut team_name: Option<String> = None;
     for line in reader.lines().map_while(Result::ok).take(80) {
         let rec: AnyRecord = match serde_json::from_str(&line) {
             Ok(v) => v,
             Err(_) => continue,
         };
+        if agent_name.is_none() {
+            if let Some(n) = rec.agent_name {
+                if !n.is_empty() {
+                    agent_name = Some(n);
+                }
+            }
+        }
+        if team_name.is_none() {
+            if let Some(t) = rec.team_name {
+                if !t.is_empty() {
+                    team_name = Some(t);
+                }
+            }
+        }
         if cwd.is_none() {
             if let Some(c) = rec.cwd {
                 if !c.is_empty() {
@@ -180,11 +220,16 @@ fn scan_jsonl(path: &Path) -> (Option<String>, Option<String>) {
                 }
             }
         }
-        if summary.is_some() && cwd.is_some() {
+        if summary.is_some() && cwd.is_some() && agent_name.is_some() && team_name.is_some() {
             break;
         }
     }
-    (summary, cwd)
+    Scan {
+        summary,
+        cwd,
+        agent_name,
+        team_name,
+    }
 }
 
 fn extract_text(v: &serde_json::Value) -> String {
@@ -199,7 +244,7 @@ fn extract_text(v: &serde_json::Value) -> String {
     }
 }
 
-fn discover(root: &Path, max_age_hours: u64) -> Result<Vec<Entry>> {
+pub(crate) fn discover(root: &Path, max_age_hours: u64) -> Result<Vec<Entry>> {
     let mut out = Vec::new();
     let cutoff =
         SystemTime::now().checked_sub(std::time::Duration::from_secs(max_age_hours * 3600));
@@ -248,16 +293,18 @@ fn discover(root: &Path, max_age_hours: u64) -> Result<Vec<Entry>> {
             }
             _ => continue,
         };
-        let (summary, cwd) = scan_jsonl(p);
+        let scan = scan_jsonl(p);
+        let (mut summary, agent_name, team_name) = (scan.summary, scan.agent_name, scan.team_name);
+        let cwd = scan.cwd;
         // For subagents, prefer reading cwd from the parent session file if missing,
         // and prefer the meta.json's friendly description as the summary.
         let (cwd, summary, agent_type) = if kind == Kind::Subagent {
             let parent_session = root
                 .join(&project)
                 .join(format!("{}.jsonl", parts[1].as_os_str().to_string_lossy()));
-            let cwd = cwd.or_else(|| scan_jsonl(&parent_session).1);
+            let cwd = cwd.or_else(|| scan_jsonl(&parent_session).cwd);
             let (desc, at) = read_agent_meta(p);
-            (cwd, desc.or(summary), at)
+            (cwd, desc.or(summary.take()), at)
         } else {
             (cwd, summary, None)
         };
@@ -271,26 +318,45 @@ fn discover(root: &Path, max_age_hours: u64) -> Result<Vec<Entry>> {
             summary,
             cwd,
             tmux_session: None,
+            tmux_socket: None,
             running: false,
             agent_type,
+            agent_name,
+            team_name,
         });
     }
-    // Match running claude processes to JSONL entries by session-id (UUID == file stem).
-    for (sid, tmux) in running_claudes() {
-        if let Some(e) = out
-            .iter_mut()
-            .find(|e| e.id == sid && e.kind == Kind::Agent)
-        {
+    // Match running claude processes to their JSONL entry: normal sessions by
+    // session-id (UUID == file stem), swarm teammates by agentName + teamName.
+    for (key, loc) in running_claudes() {
+        let found = out.iter_mut().find(|e| {
+            e.kind == Kind::Agent
+                && match &key {
+                    ClaudeKey::Session(sid) => &e.id == sid,
+                    ClaudeKey::Agent { name, team } => {
+                        e.agent_name.as_deref() == Some(name)
+                            && e.team_name.as_deref() == Some(team)
+                    }
+                }
+        });
+        if let Some(e) = found {
             e.running = true;
-            e.tmux_session = tmux;
+            if let Some((session, socket)) = loc {
+                e.tmux_session = Some(session);
+                e.tmux_socket = socket;
+            }
         }
     }
     // Propagate live-ness to subagents whose parent agent is currently running and
     // whose transcript was touched in the last 60s (i.e. still being appended to).
-    let running_agents: std::collections::HashMap<String, Option<String>> = out
+    let running_agents: std::collections::HashMap<String, (Option<String>, Option<String>)> = out
         .iter()
         .filter(|e| e.kind == Kind::Agent && e.running)
-        .map(|e| (e.id.clone(), e.tmux_session.clone()))
+        .map(|e| {
+            (
+                e.id.clone(),
+                (e.tmux_session.clone(), e.tmux_socket.clone()),
+            )
+        })
         .collect();
     let now = SystemTime::now();
     let fresh = std::time::Duration::from_secs(60);
@@ -308,7 +374,7 @@ fn discover(root: &Path, max_age_hours: u64) -> Result<Vec<Entry>> {
         let Some(parent_sid) = parent_sid else {
             continue;
         };
-        let Some(parent_tmux) = running_agents.get(&parent_sid) else {
+        let Some((parent_session, parent_socket)) = running_agents.get(&parent_sid) else {
             continue;
         };
         let is_fresh = now
@@ -317,7 +383,8 @@ fn discover(root: &Path, max_age_hours: u64) -> Result<Vec<Entry>> {
             .unwrap_or(false);
         if is_fresh {
             e.running = true;
-            e.tmux_session = parent_tmux.clone();
+            e.tmux_session = parent_session.clone();
+            e.tmux_socket = parent_socket.clone();
         }
     }
     out.sort_by(|a, b| {
@@ -349,16 +416,74 @@ fn tmux_sessions() -> Vec<String> {
     }
 }
 
-/// For each running `claude` CLI process, returns (session_id, tmux_session_name_if_in_tmux).
-/// Session ID comes from the process's `--session-id <UUID>` arg, which matches the JSONL filename.
-fn running_claudes() -> Vec<(String, Option<String>)> {
+/// Directory tmux keeps its server sockets in: `$TMUX_TMPDIR`, else `/tmp/tmux-<uid>`.
+fn tmux_socket_dir() -> Option<PathBuf> {
+    if let Ok(d) = std::env::var("TMUX_TMPDIR") {
+        if !d.is_empty() {
+            return Some(PathBuf::from(d));
+        }
+    }
+    use std::os::unix::fs::MetadataExt;
+    let uid = dirs::home_dir()?.metadata().ok()?.uid();
+    Some(PathBuf::from(format!("/tmp/tmux-{uid}")))
+}
+
+/// Every tmux socket name: the default server plus any named `-L` servers
+/// (claude-swarm runs each swarm on its own `claude-swarm-<pid>` socket).
+fn tmux_socket_names() -> Vec<String> {
+    let mut names: Vec<String> = tmux_socket_dir()
+        .and_then(|dir| std::fs::read_dir(dir).ok())
+        .map(|rd| {
+            rd.flatten()
+                .filter_map(|e| e.file_name().into_string().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    if !names.iter().any(|n| n == "default") {
+        names.push("default".to_string());
+    }
+    names
+}
+
+/// Where a running claude lives in tmux: (session_name, socket_name).
+/// socket_name is None for the default server, Some(name) for a named `-L` socket (e.g. a swarm).
+type TmuxLoc = (String, Option<String>);
+
+/// How a running claude process identifies which transcript it owns.
+#[derive(Debug, Clone)]
+pub(crate) enum ClaudeKey {
+    /// Normal session: `--session-id <UUID>` matches the JSONL file stem.
+    Session(String),
+    /// Swarm teammate: `--agent-name <name> --team-name <team>`. The teammate's
+    /// JSONL records carry matching `agentName`/`teamName` fields.
+    Agent { name: String, team: String },
+}
+
+/// True if this process command's binary is a claude CLI. Matches both the
+/// `claude`/`claude-code` launcher and the versioned binary swarm teammates
+/// exec directly (e.g. `~/.local/share/claude/versions/2.1.156`).
+fn is_claude_bin(bin: &str) -> bool {
+    let base = Path::new(bin)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    base == "claude" || base == "claude-code" || bin.contains("/claude/versions/")
+}
+
+/// Value of `--flag <value>` in a whitespace-split command, if present.
+fn arg_after<'a>(rest: &'a str, flag: &str) -> Option<&'a str> {
+    rest.split_whitespace().skip_while(|t| *t != flag).nth(1)
+}
+
+/// For each running claude process, returns (identity, Option<TmuxLoc>).
+fn running_claudes() -> Vec<(ClaudeKey, Option<TmuxLoc>)> {
     let ps_out = match Command::new("ps").args(["-axo", "tty=,command="]).output() {
         Ok(o) if o.status.success() => o.stdout,
         _ => return Vec::new(),
     };
     let ps_str = String::from_utf8_lossy(&ps_out);
-    // Collect (session_id, "/dev/<tty>") for each running claude.
-    let mut running: Vec<(String, Option<String>)> = Vec::new();
+    // Collect (identity, "/dev/<tty>") for each running claude.
+    let mut running: Vec<(ClaudeKey, Option<String>)> = Vec::new();
     for line in ps_str.lines() {
         let trimmed = line.trim_start();
         let (tty, rest) = match trimmed.split_once(char::is_whitespace) {
@@ -367,51 +492,71 @@ fn running_claudes() -> Vec<(String, Option<String>)> {
         };
         let rest = rest.trim_start();
         let bin = rest.split_whitespace().next().unwrap_or("");
-        let base = Path::new(bin)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
-        if base != "claude" && base != "claude-code" {
+        if !is_claude_bin(bin) {
             continue;
         }
-        // Extract --session-id <UUID>.
-        let sid = rest
-            .split_whitespace()
-            .skip_while(|t| *t != "--session-id")
-            .nth(1)
-            .map(|s| s.to_string());
-        let Some(sid) = sid else { continue };
+        // Prefer --session-id (normal sessions); fall back to the swarm
+        // teammate's --agent-name/--team-name pair.
+        let key = if let Some(sid) = arg_after(rest, "--session-id") {
+            ClaudeKey::Session(sid.to_string())
+        } else if let (Some(name), Some(team)) = (
+            arg_after(rest, "--agent-name"),
+            arg_after(rest, "--team-name"),
+        ) {
+            ClaudeKey::Agent {
+                name: name.to_string(),
+                team: team.to_string(),
+            }
+        } else {
+            continue;
+        };
         let tty_dev = if tty == "?" || tty == "??" {
             None
         } else {
             Some(format!("/dev/{tty}"))
         };
-        running.push((sid, tty_dev));
+        running.push((key, tty_dev));
     }
     if running.is_empty() {
         return Vec::new();
     }
-    // Build tty -> tmux session map.
-    let tmux_out = Command::new("tmux")
-        .args(["list-panes", "-aF", "#{pane_tty}\t#{session_name}"])
-        .output();
-    let mut tty_to_session: std::collections::HashMap<String, String> =
+    // Build tty -> (session, socket) map by querying every tmux server socket,
+    // not just the default one. Swarm panes live on `claude-swarm-*` sockets.
+    let mut tty_to_loc: std::collections::HashMap<String, (String, Option<String>)> =
         std::collections::HashMap::new();
-    if let Ok(o) = tmux_out {
-        if o.status.success() {
-            for line in String::from_utf8_lossy(&o.stdout).lines() {
-                if let Some((tty, sess)) = line.split_once('\t') {
-                    tty_to_session.insert(tty.to_string(), sess.to_string());
-                }
+    for socket in tmux_socket_names() {
+        let out = Command::new("tmux")
+            .args([
+                "-L",
+                &socket,
+                "list-panes",
+                "-aF",
+                "#{pane_tty}\t#{session_name}",
+            ])
+            .output();
+        let Ok(o) = out else { continue };
+        if !o.status.success() {
+            continue;
+        }
+        let socket_opt = if socket == "default" {
+            None
+        } else {
+            Some(socket.clone())
+        };
+        for line in String::from_utf8_lossy(&o.stdout).lines() {
+            if let Some((tty, sess)) = line.split_once('\t') {
+                tty_to_loc
+                    .entry(tty.to_string())
+                    .or_insert_with(|| (sess.to_string(), socket_opt.clone()));
             }
         }
     }
-    // Resolve each running entry's tty -> tmux session (or None).
+    // Resolve each running entry's tty -> (session, socket), or None if not in tmux.
     running
         .into_iter()
-        .map(|(sid, tty)| {
-            let tmux = tty.and_then(|t| tty_to_session.get(&t).cloned());
-            (sid, tmux)
+        .map(|(key, tty)| {
+            let loc = tty.and_then(|t| tty_to_loc.get(&t).cloned());
+            (key, loc)
         })
         .collect()
 }
@@ -486,7 +631,10 @@ fn open_viewer(entry: &Entry) -> Result<()> {
     // always fall through to the transcript tailer.
     if entry.kind == Kind::Agent {
         if let Some(s) = entry.tmux_session.as_deref() {
-            let cmd = format!("tmux attach -t '{s}'");
+            let cmd = match entry.tmux_socket.as_deref() {
+                Some(sock) => format!("tmux -L '{sock}' attach -t '{s}'"),
+                None => format!("tmux attach -t '{s}'"),
+            };
             println!("Attaching to tmux session: {s}");
             return ghostty_run(&cmd);
         }
@@ -552,7 +700,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let picked = tui::run(entries, max_age_hours)?;
+    let picked = tui::run(entries, root, max_age_hours)?;
     if let Some(p) = picked {
         open_viewer(&p)?;
     }
